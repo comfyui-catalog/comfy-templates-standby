@@ -1,0 +1,4 @@
+{
+  "date": "2026-09-19",
+  "purpose": "public observability: last successful data-refresh run (cold-standby runner; primary is comfy-backend/comfy-templates-runner)"
+}
