@@ -1,4 +1,6 @@
 {
-  "date": "2026-09-19",
-  "purpose": "public observability: last successful data-refresh run (cold-standby runner; primary is comfy-backend/comfy-templates-runner)"
+  "date": "2026-09-29",
+  "built_at": "2026-09-29T01:51:18.612467+00:00",
+  "corpus_total": 940,
+  "purpose": "public observability: last successful data-refresh run (keeps GHA schedules alive + shows liveness of the weekly workload)"
 }
