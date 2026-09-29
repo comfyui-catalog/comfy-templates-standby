@@ -15,6 +15,16 @@ name: Freshness Watchdog
 # 60-day schedule-inactivity auto-disable cascade, runner-repo
 # deletion/wipe.
 #
+# TWO independent probes (W2-c P2-6, 2026-09-29):
+#   1. prod freshness — comfy-templates.vercel.app/data/stats.json
+#      built_at age (the user-visible signal);
+#   2. PRIMARY RUNNER heartbeat — comfy-backend/comfy-templates-runner's
+#      public state/last-run.json date. A stale state file with fresh
+#      prod means the runner's state step is failing — the leading
+#      indicator of the 60-day schedule-timer erosion (no commits to
+#      the runner repo → GitHub eventually disables its schedules →
+#      the weekly refresh dies → only then does prod go stale).
+#
 # Threshold math: prod freshness comes ONLY from the Monday 16:00 UTC
 # cron + Tuesday 17:07 backstop (the sandbox Thursday daemon never
 # commits). age > 8 days therefore means TWO consecutive weekly windows
@@ -59,10 +69,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check production freshness
+      - name: Check production freshness + primary-runner heartbeat
         env:
           PROD_STATS_URL: https://comfy-templates.vercel.app/data/stats.json
-          THRESHOLD: ${{ inputs.threshold || 8 }}
+          RUNNER_STATE_URL: https://raw.githubusercontent.com/comfy-backend/comfy-templates-runner/main/state/last-run.json
+          # NOTE: the default lives in the python below, NOT in a
+          # `${{ inputs.threshold || 8 }}` expression — that coerces an
+          # explicit 0 to 8 (W2-c: the documented threshold-0 drill was
+          # silently impossible; drill=true remains the red-drill path).
+          THRESHOLD: ${{ inputs.threshold }}
+          STATE_MAX_AGE: 10
           DRILL: ${{ inputs.drill || false }}
         run: |
           set -euo pipefail
@@ -71,10 +87,12 @@ jobs:
           import json
           import os
           import sys
+          import urllib.error
           import urllib.request
 
           url = os.environ["PROD_STATS_URL"]
-          threshold = float(os.environ["THRESHOLD"])
+          threshold = float(os.environ.get("THRESHOLD") or 8)
+          state_max_age = float(os.environ.get("STATE_MAX_AGE") or 10)
           drill = os.environ["DRILL"] == "true"
 
           if drill:
@@ -112,6 +130,38 @@ jobs:
                     f"old (> {threshold}d). Two+ weekly refresh windows were "
                     f"missed — check the primary runner's recent runs, its "
                     f"GH_PAT secret, and the Vercel deploy.")
+              sys.exit(1)
+
+          # Probe 2 (W2-c P2-6): the PRIMARY runner's own heartbeat. A
+          # stale/missing state file while prod is still fresh = the
+          # state step is failing — the leading indicator of the 60-day
+          # schedule-timer erosion on the runner repo.
+          state_url = os.environ["RUNNER_STATE_URL"]
+          try:
+              with urllib.request.urlopen(state_url, timeout=30) as resp:
+                  runner_state = json.load(resp)
+              state_date = runner_state.get("date", "")
+              state_age = (datetime.datetime.now(datetime.timezone.utc).date()
+                           - datetime.date.fromisoformat(state_date)).days
+              print(f"primary runner state: date={state_date} age={state_age}d "
+                    f"(max {state_max_age:.0f}d)")
+              if state_age > state_max_age:
+                  print(f"::error::PRIMARY RUNNER HEARTBEAT STALE: "
+                        f"state/last-run.json date {state_date} is {state_age}d "
+                        f"old (> {state_max_age:.0f}d) while prod is fresh "
+                        f"({age_days:.1f}d). The runner's state step is failing — "
+                        f"fix it before GitHub's 60-day rule disables the "
+                        f"runner repo's schedules (then the weekly refresh "
+                        f"itself dies).")
+                  sys.exit(1)
+          except urllib.error.URLError as e:
+              print(f"::error::PRIMARY RUNNER HEARTBEAT MISSING: could not "
+                    f"fetch {state_url}: {e}. If this persists, the primary "
+                    f"runner's state step (or the whole repo) is gone.")
+              sys.exit(1)
+          except (ValueError, KeyError) as e:
+              print(f"::error::PRIMARY RUNNER HEARTBEAT UNPARSEABLE: {e} "
+                    f"(payload shape drift in state/last-run.json?)")
               sys.exit(1)
           print("freshness OK")
           PYEOF
@@ -237,25 +287,33 @@ jobs:
 
           body_text = (
               f"{marker}\n"
-              f"**PRODUCTION DATA IS STALE (freshness watchdog)** — "
-              f"comfy-templates.vercel.app has not been refreshed within "
-              f"the threshold window.\n\n"
+              f"**Freshness watchdog FAILED** — production data freshness "
+              f"is at risk. Read the red step's `::error::` line for the "
+              f"exact class, then triage:\n\n"
               f"- Watchdog run: {run_url}\n"
               f"- Job status: `{os.environ['JOB_STATUS']}`  |  "
-              f"Time (UTC): {datetime.datetime.utcnow().isoformat()}\n\n"
-              f"Likely causes, in order: (1) the primary runner's `GH_PAT` "
-              f"secret is dead (check `comfy-backend/comfy-templates-runner` "
-              f"recent runs — the 2026-09-21 incident class; fix = "
-              f"`set-secret.py` on BOTH runner repos); (2) the Monday cron "
-              f"+ Tuesday backstop were both dropped AND Thursday's sandbox "
-              f"daemon didn't run; (3) a Vercel deploy failure (check the "
-              f"commit author rule: data commits must be trinitylivy).\n\n"
+              f"Time (UTC): {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n"
+              f"| Red step message | Likely cause | Fix |\n"
+              f"|---|---|---|\n"
+              f"| PRODUCTION DATA IS STALE | the Monday cron + Tuesday "
+              f"backstop were missed | check the primary runner's recent "
+              f"runs + its `GH_PAT` secret (the 2026-09-21 incident class; "
+              f"fix = `set-secret.py` on BOTH runner repos), then the "
+              f"Vercel deploy (commit author rule) |\n"
+              f"| PRIMARY RUNNER HEARTBEAT STALE/MISSING | the runner's "
+              f"state step is failing while prod still looks fresh | fix "
+              f"the state step before the 60-day rule disables the runner "
+              f"repo's schedules |\n"
+              f"| heartbeat commit failed | THIS repo's own "
+              f"state/watchdog.json commit failed | fix this repo's push "
+              f"permissions (it is the 60-day timer for the watchdog "
+              f"itself) |\n\n"
               f"cc @trinitylivy"
           )
 
           if not open_alerts:
               call("POST", f"/repos/{repo}/issues", json.dumps({
-                  "title": "Production data STALE — freshness watchdog",
+                  "title": "Freshness watchdog FAILED — action required",
                   "body": body_text,
                   "labels": [label],
               }).encode())
