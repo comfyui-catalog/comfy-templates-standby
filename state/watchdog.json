@@ -1,6 +1,6 @@
 {
-  "date": "2026-10-01",
-  "prod_built_at": "2026-09-30T02:04:38.908399+00:00",
-  "prod_total_workflows": 940,
+  "date": "2026-10-08",
+  "prod_built_at": "2026-10-06T21:36:32.139390+00:00",
+  "prod_total_workflows": 956,
   "purpose": "watchdog heartbeat: keeps this repo's schedules past GitHub's 60-day inactivity rule and exposes the last observed prod freshness"
 }
