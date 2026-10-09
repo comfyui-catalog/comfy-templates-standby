@@ -196,9 +196,12 @@ jobs:
           # (NETLIFY_AUTH_TOKEN/SITE_ID deleted) → red. "skipped_no_push"
           # is a legitimate per-run skip → warning only.
           blobs = runner_state.get("blobs_snapshot", "")
-          if blobs == "failed":
+          # W18-b: also accept GHA's outcome vocabulary 'failure' (the
+          # fallback when the step dies before writing its output) —
+          # W18-r3 P3-2.
+          if blobs in ("failed", "failure"):
               print(f"::error::BLOBS LANE FAILING: the last refresh run's "
-                    f"blobs_snapshot = 'failed' (Netlify Blobs tertiary "
+                    f"blobs_snapshot = {blobs!r} (Netlify Blobs tertiary "
                     f"backup not landing — check NETLIFY_AUTH_TOKEN / "
                     f"NETLIFY_SITE_ID on the runner repo and the blobs "
                     f"store quota).")
@@ -211,6 +214,33 @@ jobs:
               sys.exit(1)
           if blobs:
               print(f"blobs lane: {blobs}")
+
+          # Probe 3b (W18-b GAP 5b): the GL mirror is FATAL-by-design in
+          # both lanes (the user's data-on-GitLab contract) — a failed
+          # mirror means the run red AFTER pushing (data safe on GitHub)
+          # and the state (written on any exit) carries gl_mirror:
+          # "failure". Without this probe, a permanently dead GITLAB_PAT
+          # would only show as red pipeline runs, never in the watchdog.
+          gl = runner_state.get("gl_mirror", "")
+          if gl in ("failure", "failed"):
+              print(f"::error::GITLAB MIRROR FAILING: the last refresh "
+                    f"run's gl_mirror = {gl!r} — the redundant data backup "
+                    f"is NOT landing on GitLab (data is safe on GitHub; "
+                    f"check GITLAB_PAT on the runner repo / the GL repo).")
+              sys.exit(1)
+          if gl:
+              print(f"gl mirror lane: {gl}")
+
+          # Floor (W18-b GAP 4a): an independent prod-side re-check of
+          # audit check D's absolute floor — a corpus bleed to the floor
+          # (967 -> 800 over days) passes every per-run gate; this makes
+          # the decay visible at the outer net.
+          if total is not None and total < 800:
+              print(f"::error::CORPUS FLOOR BREACHED: prod total_workflows "
+                    f"= {total} (< 800) — upstream collection has decayed "
+                    f"past the absolute floor (every per-run gate passed; "
+                    f"this is the slow-rot backstop).")
+              sys.exit(1)
           print("freshness OK")
           PYEOF
 
@@ -299,7 +329,12 @@ jobs:
         # W18-r1 P2: scoped to the CHECK step's failure only — a failed
         # heartbeat (this repo's commit problem) or a deliberate drill
         # must NOT dispatch a production refresh.
-        if: failure() && steps.check.outcome == 'failure' && inputs.drill != true
+        # W18-b GAP 10b: the 04:30 probe additionally does NOT self-heal —
+        # a late/queued 04:00 Netlify build could still be in flight, and
+        # a concurrent GHA scrape is the 2026-10-09 rate-limit incident
+        # class. The 16:30 probe (12.5h clear) and manual dispatch heal.
+        if: failure() && steps.check.outcome == 'failure' && inputs.drill != true && github.event.schedule != '30 4 * * *'
+
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           PRIMARY_REPO: comfy-backend/comfy-templates-runner
