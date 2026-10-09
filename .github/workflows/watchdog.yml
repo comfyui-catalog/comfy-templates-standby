@@ -9,7 +9,8 @@ name: Freshness Watchdog
 #   * needs ZERO secrets — it fetches the PUBLIC prod stats.json.
 #
 # What it catches: every failure class ABOVE production — dead/rotted
-# GH_PAT on the primary runner (the 2026-09-21 incident class: Mon+Tue
+# GH_PAT on the primary runner (the 2026-09-21 incident class: the
+# then-scheduled Mon+Tue runs
 # runs failed at checkout, prod froze, NOTHING alerted for ~5 days),
 # Vercel deploy failures (incl. the commit-author trap), GitHub's
 # 60-day schedule-inactivity auto-disable cascade, runner-repo
@@ -25,13 +26,17 @@ name: Freshness Watchdog
 #      the runner repo → GitHub eventually disables its schedules →
 #      the weekly refresh dies → only then does prod go stale).
 #
-# Threshold math (W18 ramp-up, 2026-10-09): prod freshness comes from
-# the Netlify daily 04:00 UTC fire (primary lane) + the GHA Wednesday
-# 16:00 / Thursday 17:07 backup lane. Daily churn commits re-stamp
-# built_at, so age > 26h means the last daily fire AND any same-window
-# GHA run were both missed — one dropped Netlify fire alone never reds
-# (the GHA Wednesday lane covers mid-week gaps; worst-case detection
-# ~36h, typically ~12h).
+# Threshold math (W18 ramp-up, 2026-10-09, corrected r1): prod freshness
+# comes from the Netlify daily 04:00 UTC fire (primary) + the GHA
+# Wednesday/Thursday backup lane. Daily churn commits re-stamp built_at,
+# so age > 26h means the daily contract is broken. Detection is
+# quantized to the probes: with the 04:30 + 16:30 daily pair, a dead
+# Netlify lane is caught at the SECOND probe past the last stamp —
+# nominal ~36h, ~48-60h when the scheduler drops one probe (observed
+# drop rate ~1/3), before the GHA Wednesday lane lands (which resets
+# the clock but cannot satisfy a 26h daily contract alone — though the
+# red → self-heal loop makes the GHA lane effectively take over the
+# daily refresh while Netlify is down).
 #
 # The state/watchdog.json commit (step 2) is a HEARTBEAT, not
 # best-effort: only commits keep a repo's schedules alive past GitHub's
@@ -49,9 +54,11 @@ on:
     # (W18 ramp-up: daily cadence landed 2026-10-09; this is the
     # Netlify-cron-unreliability catcher per DESIGN_W15 ramp-up spec).
     - cron: "30 4 * * *"
-    # Thursday 16:23 UTC kept as a second weekly probe (belt-and-
-    # suspenders against GitHub dropping the daily 04:30 slot — the
-    # observed scheduler drop rate is ~1/3 under platform load).
+    # W18-r1: a SECOND daily probe at 16:30 UTC — one probe/day means a
+    # single scheduler drop pushes detection from ~36h to ~72h; the pair
+    # halves the quantization step (nominal ~36h, one-drop ~48-60h).
+    - cron: "30 16 * * *"
+    # Thursday 16:23 UTC kept as a third probe (belt-and-suspenders).
     - cron: "23 16 * * 4"
   workflow_dispatch:
     inputs:
@@ -79,6 +86,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check production freshness + primary-runner heartbeat
+        id: check
         env:
           PROD_STATS_URL: https://comfy-templates.vercel.app/data/stats.json
           RUNNER_STATE_URL: https://raw.githubusercontent.com/comfy-backend/comfy-templates-runner/main/state/last-run.json
@@ -139,10 +147,11 @@ jobs:
                 f"(threshold {threshold}d)")
           if age_days > threshold:
               print(f"::error::PRODUCTION DATA IS STALE: {age_days:.1f} days "
-                    f"old (> {threshold}d). The Netlify daily fire AND the "
-                    f"GHA Wednesday/Thursday backup lane were both missed — "
-                    f"check the Netlify site deploys, the primary runner's "
-                    f"recent runs + its GH_PAT secret, and the Vercel deploy.")
+                    f"old (> {threshold}d) — no refresh in >26h. The Netlify "
+                    f"daily fire is missing (check the site deploys + build "
+                    f"hook first; a green weekly GHA run alone cannot satisfy "
+                    f"the daily contract). Also check the primary runner's "
+                    f"recent runs + GH_PAT secret, and the Vercel deploy.")
               sys.exit(1)
 
           # Probe 2 (W2-c P2-6): the PRIMARY runner's own heartbeat. A
@@ -287,7 +296,10 @@ jobs:
         # GH_PAT (verified to carry workflow-dispatch scope 2026-10-09)
         # does the POST. Best-effort: the alert step still fires, and
         # the next day's watchdog re-checks.
-        if: failure()
+        # W18-r1 P2: scoped to the CHECK step's failure only — a failed
+        # heartbeat (this repo's commit problem) or a deliberate drill
+        # must NOT dispatch a production refresh.
+        if: failure() && steps.check.outcome == 'failure' && inputs.drill != true
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           PRIMARY_REPO: comfy-backend/comfy-templates-runner
@@ -300,6 +312,7 @@ jobs:
           code=$(curl -s -o /tmp/heal.json -w "%{http_code}" -X POST \
             -H "Authorization: token ${GH_PAT}" \
             -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
             "https://api.github.com/repos/${PRIMARY_REPO}/actions/workflows/refresh.yml/dispatches" \
             -d '{"ref":"main"}')
           if [ "$code" = "204" ]; then
@@ -362,9 +375,10 @@ jobs:
               f"Time (UTC): {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n"
               f"| Red step message | Likely cause | Fix |\n"
               f"|---|---|---|\n"
-              f"| PRODUCTION DATA IS STALE | the Netlify daily fire AND the "
-              f"GHA Wed/Thu backup lane were missed | check the Netlify "
-              f"site's deploys + build hook, then the primary runner's "
+              f"| PRODUCTION DATA IS STALE | no refresh in >26h — the "
+              f"Netlify daily fire is missing (GHA weekly may be green) | "
+              f"check the Netlify site's deploys + build hook, then the "
+              f"primary runner's "
               f"recent runs + its `GH_PAT` secret (the 2026-09-21 "
               f"incident class; fix = `set-secret.py` on BOTH runner "
               f"repos), then the Vercel deploy (commit author rule) |\n"
