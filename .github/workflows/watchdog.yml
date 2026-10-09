@@ -25,11 +25,13 @@ name: Freshness Watchdog
 #      the runner repo → GitHub eventually disables its schedules →
 #      the weekly refresh dies → only then does prod go stale).
 #
-# Threshold math: prod freshness comes ONLY from the Monday 16:00 UTC
-# cron + Tuesday 17:07 backstop (the sandbox Thursday daemon never
-# commits). age > 8 days therefore means TWO consecutive weekly windows
-# were fully missed (Monday AND its Tuesday backstop, twice over) —
-# no false positive on a single dropped run.
+# Threshold math (W18 ramp-up, 2026-10-09): prod freshness comes from
+# the Netlify daily 04:00 UTC fire (primary lane) + the GHA Wednesday
+# 16:00 / Thursday 17:07 backup lane. Daily churn commits re-stamp
+# built_at, so age > 26h means the last daily fire AND any same-window
+# GHA run were both missed — one dropped Netlify fire alone never reds
+# (the GHA Wednesday lane covers mid-week gaps; worst-case detection
+# ~36h, typically ~12h).
 #
 # The state/watchdog.json commit (step 2) is a HEARTBEAT, not
 # best-effort: only commits keep a repo's schedules alive past GitHub's
@@ -43,13 +45,20 @@ name: Freshness Watchdog
 
 on:
   schedule:
-    - cron: "23 16 * * 4" # Thursday 16:23 UTC (off-peak :23 convention)
+    # Daily 04:30 UTC — 30 min after the Netlify 04:00 daily fire
+    # (W18 ramp-up: daily cadence landed 2026-10-09; this is the
+    # Netlify-cron-unreliability catcher per DESIGN_W15 ramp-up spec).
+    - cron: "30 4 * * *"
+    # Thursday 16:23 UTC kept as a second weekly probe (belt-and-
+    # suspenders against GitHub dropping the daily 04:30 slot — the
+    # observed scheduler drop rate is ~1/3 under platform load).
+    - cron: "23 16 * * 4"
   workflow_dispatch:
     inputs:
       threshold:
-        description: "Alert when prod built_at age exceeds this many days"
+        description: "Alert when prod built_at age exceeds this many DAYS (default 1.0833 = 26h)"
         type: number
-        default: 8
+        default: 1.0833
       drill:
         description: "Fail on purpose to drill the alert/notification loop"
         type: boolean
@@ -78,7 +87,7 @@ jobs:
           # explicit 0 to 8 (W2-c: the documented threshold-0 drill was
           # silently impossible; drill=true remains the red-drill path).
           THRESHOLD: ${{ inputs.threshold }}
-          STATE_MAX_AGE: 10
+          STATE_MAX_AGE: 2
           DRILL: ${{ inputs.drill || false }}
         run: |
           set -euo pipefail
@@ -91,8 +100,11 @@ jobs:
           import urllib.request
 
           url = os.environ["PROD_STATS_URL"]
-          threshold = float(os.environ.get("THRESHOLD") or 8)
-          state_max_age = float(os.environ.get("STATE_MAX_AGE") or 10)
+          # W18 ramp-up: daily cadence → 26h threshold (1.0833d). A red
+          # here means the Netlify daily fire AND the GHA Wednesday/
+          # Thursday lane were both missed within the last ~26h window.
+          threshold = float(os.environ.get("THRESHOLD") or 1.0833)
+          state_max_age = float(os.environ.get("STATE_MAX_AGE") or 2)
           drill = os.environ["DRILL"] == "true"
 
           if drill:
@@ -127,9 +139,10 @@ jobs:
                 f"(threshold {threshold}d)")
           if age_days > threshold:
               print(f"::error::PRODUCTION DATA IS STALE: {age_days:.1f} days "
-                    f"old (> {threshold}d). Two+ weekly refresh windows were "
-                    f"missed — check the primary runner's recent runs, its "
-                    f"GH_PAT secret, and the Vercel deploy.")
+                    f"old (> {threshold}d). The Netlify daily fire AND the "
+                    f"GHA Wednesday/Thursday backup lane were both missed — "
+                    f"check the Netlify site deploys, the primary runner's "
+                    f"recent runs + its GH_PAT secret, and the Vercel deploy.")
               sys.exit(1)
 
           # Probe 2 (W2-c P2-6): the PRIMARY runner's own heartbeat. A
@@ -163,6 +176,32 @@ jobs:
               print(f"::error::PRIMARY RUNNER HEARTBEAT UNPARSEABLE: {e} "
                     f"(payload shape drift in state/last-run.json?)")
               sys.exit(1)
+
+          # Probe 3 (W18): the tertiary Blobs lane. state/last-run.json's
+          # blobs_snapshot field carries the LAST run's outcome. "failed"
+          # = the blobs step ran and red (dead token / store) → red here
+          # too (same-day detection WITHOUT coupling primary availability
+          # to tertiary storage — the DESIGN_W15 "promote to fatal" idea,
+          # amended in W18: watchdog-detect instead of pipeline-fatal).
+          # "skipped_no_secrets" after 2026-10-09 = a secret regression
+          # (NETLIFY_AUTH_TOKEN/SITE_ID deleted) → red. "skipped_no_push"
+          # is a legitimate per-run skip → warning only.
+          blobs = runner_state.get("blobs_snapshot", "")
+          if blobs == "failed":
+              print(f"::error::BLOBS LANE FAILING: the last refresh run's "
+                    f"blobs_snapshot = 'failed' (Netlify Blobs tertiary "
+                    f"backup not landing — check NETLIFY_AUTH_TOKEN / "
+                    f"NETLIFY_SITE_ID on the runner repo and the blobs "
+                    f"store quota).")
+              sys.exit(1)
+          if blobs == "skipped_no_secrets":
+              print(f"::error::BLOBS LANE MISCONFIGURED: blobs_snapshot = "
+                    f"'skipped_no_secrets' but the secrets were set "
+                    f"2026-10-09 — NETLIFY_AUTH_TOKEN / NETLIFY_SITE_ID "
+                    f"were deleted or renamed on the runner repo.")
+              sys.exit(1)
+          if blobs:
+              print(f"blobs lane: {blobs}")
           print("freshness OK")
           PYEOF
 
@@ -241,6 +280,34 @@ jobs:
           print(f"state/watchdog.json updated to {today}.")
           PYEOF
 
+      - name: Self-heal (dispatch the primary refresh — W18 ramp-up)
+        # When the check reds, the daily lanes are all stale — dispatch
+        # the primary GHA refresh directly (Netlify cron unreliability /
+        # a dead GHA schedule both heal through this). The standby's
+        # GH_PAT (verified to carry workflow-dispatch scope 2026-10-09)
+        # does the POST. Best-effort: the alert step still fires, and
+        # the next day's watchdog re-checks.
+        if: failure()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          PRIMARY_REPO: comfy-backend/comfy-templates-runner
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_PAT}" ]; then
+            echo "::warning::GH_PAT secret not set on this repo — cannot self-heal-dispatch"
+            exit 0
+          fi
+          code=$(curl -s -o /tmp/heal.json -w "%{http_code}" -X POST \
+            -H "Authorization: token ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${PRIMARY_REPO}/actions/workflows/refresh.yml/dispatches" \
+            -d '{"ref":"main"}')
+          if [ "$code" = "204" ]; then
+            echo "self-heal: dispatched the primary refresh (HTTP 204)"
+          else
+            echo "::warning::self-heal dispatch failed (HTTP ${code}): $(head -c 200 /tmp/heal.json)"
+          fi
+
       - name: Alert on failure (open/comment alert issue)
         if: failure() || cancelled()
         env:
@@ -295,19 +362,30 @@ jobs:
               f"Time (UTC): {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n"
               f"| Red step message | Likely cause | Fix |\n"
               f"|---|---|---|\n"
-              f"| PRODUCTION DATA IS STALE | the Monday cron + Tuesday "
-              f"backstop were missed | check the primary runner's recent "
-              f"runs + its `GH_PAT` secret (the 2026-09-21 incident class; "
-              f"fix = `set-secret.py` on BOTH runner repos), then the "
-              f"Vercel deploy (commit author rule) |\n"
+              f"| PRODUCTION DATA IS STALE | the Netlify daily fire AND the "
+              f"GHA Wed/Thu backup lane were missed | check the Netlify "
+              f"site's deploys + build hook, then the primary runner's "
+              f"recent runs + its `GH_PAT` secret (the 2026-09-21 "
+              f"incident class; fix = `set-secret.py` on BOTH runner "
+              f"repos), then the Vercel deploy (commit author rule) |\n"
               f"| PRIMARY RUNNER HEARTBEAT STALE/MISSING | the runner's "
               f"state step is failing while prod still looks fresh | fix "
               f"the state step before the 60-day rule disables the runner "
               f"repo's schedules |\n"
+              f"| BLOBS LANE FAILING | the tertiary Netlify Blobs backup "
+              f"step red on the last refresh run | check "
+              f"`NETLIFY_AUTH_TOKEN` / `NETLIFY_SITE_ID` on the runner "
+              f"repos and the blobs store; the data refresh itself is "
+              f"NOT blocked (warning-class by design, W18 amendment) |\n"
+              f"| BLOBS LANE MISCONFIGURED | blobs_snapshot = "
+              f"skipped_no_secrets after secrets were set 2026-10-09 | "
+              f"re-set the secrets via `set-secret.py` |\n"
               f"| heartbeat commit failed | THIS repo's own "
               f"state/watchdog.json commit failed | fix this repo's push "
               f"permissions (it is the 60-day timer for the watchdog "
               f"itself) |\n\n"
+              f"A self-heal dispatch of the primary refresh was attempted "
+              f"(see the run log above).\n\n"
               f"cc @trinitylivy"
           )
 
