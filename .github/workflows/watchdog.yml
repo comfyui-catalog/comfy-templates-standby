@@ -215,12 +215,17 @@ jobs:
           if blobs:
               print(f"blobs lane: {blobs}")
 
-          # Probe 3b (W18-b GAP 5b): the GL mirror is FATAL-by-design in
-          # both lanes (the user's data-on-GitLab contract) — a failed
-          # mirror means the run red AFTER pushing (data safe on GitHub)
-          # and the state (written on any exit) carries gl_mirror:
-          # "failure". Without this probe, a permanently dead GITLAB_PAT
-          # would only show as red pipeline runs, never in the watchdog.
+          # Probe 3b (W18-b GAP 5b): the GL mirror lane's outcome, read
+          # from state/last-run.json (written on ANY exit by both lanes'
+          # state steps). W89 (2026-10-31): GL failures were demoted to
+          # WARNING-CLASS in both lanes (continue-on-error on GHA,
+          # no-exit on Netlify) — the runs stay green on a GL-only outage,
+          # so the state record gl_mirror="failure" (or "failed") is the
+          # signal and THIS PROBE IS THE ONLY PAGING GL-OUTAGE SIGNAL
+          # left (the lanes' own ::error::/::warning:: annotations are
+          # recorded but non-paging). Do NOT re-fatalize the mirror step
+          # over this — that re-creates the 2026-10-21..31 incident (9
+          # days of red builds while data kept landing).
           gl = runner_state.get("gl_mirror", "")
           if gl in ("failure", "failed"):
               print(f"::error::GITLAB MIRROR FAILING: the last refresh "
@@ -429,6 +434,17 @@ jobs:
               f"| BLOBS LANE MISCONFIGURED | blobs_snapshot = "
               f"skipped_no_secrets after secrets were set 2026-10-09 | "
               f"re-set the secrets via `set-secret.py` |\n"
+              f"| GITLAB MIRROR FAILING | the last refresh run's "
+              f"gl_mirror = 'failure'/'failed' — the redundant GitLab "
+              f"backup is not landing (post-W89 this probe is the ONLY "
+              f"paging GL-outage signal: both lanes are warning-class on "
+              f"GL failures) | check `GITLAB_PAT` on BOTH runner repos "
+              f"(`comfy-backend/comfy-templates-runner`, `comfyui-catalog/"
+              f"comfy-templates-standby`) AND the Netlify site env "
+              f"`GITLAB_PAT` (site shiny-pavlova) — likely dead/rotted "
+              f"(the 2026-10-21 class); the fix is a fresh GL PAT from "
+              f"the owner, set in all three places. Data is NOT blocked "
+              f"(GitHub holds it; W89 warning-class) |\n"
               f"| heartbeat commit failed | THIS repo's own "
               f"state/watchdog.json commit failed | fix this repo's push "
               f"permissions (it is the 60-day timer for the watchdog "
